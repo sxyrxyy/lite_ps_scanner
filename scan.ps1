@@ -1,6 +1,3 @@
-# Enhanced Network Scanner with Hostname Resolution
-# Supports CIDR or range, fast timeouts, hostname lookup on live hosts
-
 function Get-IPRange {
     param (
         [string]$InputRange
@@ -8,8 +5,8 @@ function Get-IPRange {
 
     $ipList = @()
 
-    # CIDR notation
-    if ($InputRange -match '^\d+\.\d+\.\d+\.\d+/\d+$') {
+    # CIDR notation: e.g., 192.168.1.0/24
+    if ($InputRange -match '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') {
         $parts = $InputRange -split '/'
         $baseIP = $parts[0]
         $prefix = [int]$parts[1]
@@ -19,33 +16,39 @@ function Get-IPRange {
             return @()
         }
 
+        # Convert base IP to integer
         $ipParts = $baseIP -split '\.'
-        $ipInt = ([int]$ipParts[0] -shl 24) + 
-                 ([int]$ipParts[1] -shl 16) + 
-                 ([int]$ipParts[2] -shl 8)  + 
-                 [int]$ipParts[3]
+        $ipInt = ([uint32]$ipParts[0] -shl 24) + 
+                 ([uint32]$ipParts[1] -shl 16) + 
+                 ([uint32]$ipParts[2] -shl 8)  + 
+                 [uint32]$ipParts[3]
 
-        $mask = (-bnot ((1 -shl (32 - $prefix)) - 1)) -band [uint32]::MaxValue
-        $networkInt = $ipInt -band $mask
-        $hostMax = ([math]::Pow(2, (32 - $prefix))) - 1
+        # Calculate network address and broadcast
+        $hostBits = 32 - $prefix
+        $hostCount = [math]::Pow(2, $hostBits)
+        $mask = [uint32](0xFFFFFFFF -shl $hostBits) -shr $hostBits  # Correct mask
+        $networkInt = $ipInt -band (0xFFFFFFFF -shl $hostBits)
+        $broadcastInt = $networkInt + $hostCount - 1
 
-        if ($hostMax -le 1) {
-            Write-Warning "CIDR $InputRange has no scannable hosts (/$prefix)."
+        # For /31 and /32, no host IPs to scan (RFC 3021), so warn and return empty
+        if ($hostCount -le 2) {
+            Write-Warning "CIDR $InputRange has no scannable host addresses (/$prefix)."
             return @()
         }
 
-        for ($i = 1; $i -lt $hostMax; $i++) {
+        # Generate IPs from network+1 to broadcast-1
+        for ($i = 1; $i -lt ($hostCount - 1); $i++) {
             $hostInt = $networkInt + $i
             $oct1 = ($hostInt -shr 24) -band 255
             $oct2 = ($hostInt -shr 16) -band 255
-            $oct3 = ($hostInt -  8)  -band 255
+            $oct3 = ($hostInt -shr 8)  -band 255
             $oct4 = $hostInt -band 255
             $ipList += "$oct1.$oct2.$oct3.$oct4"
         }
         return $ipList
     }
-    # Range format
-    elseif ($InputRange -match '^\d+\.\d+\.\d+\.\d+-\d+\.\d+\.\d+\.\d+$') {
+    # Range format: 192.168.1.1-192.168.1.254
+    elseif ($InputRange -match '^\d{1,3}(\.\d{1,3}){3}-\d{1,3}(\.\d{1,3}){3}$') {
         $parts = $InputRange -split '-'
         $startIP = $parts[0]
         $endIP = $parts[1]
@@ -53,15 +56,15 @@ function Get-IPRange {
         $startParts = $startIP -split '\.'
         $endParts = $endIP -split '\.'
 
-        $startInt = ([int]$startParts[0] -shl 24) + 
-                    ([int]$startParts[1] -shl 16) + 
-                    ([int]$startParts[2] -shl 8)  + 
-                    [int]$startParts[3]
+        $startInt = ([uint32]$startParts[0] -shl 24) + 
+                    ([uint32]$startParts[1] -shl 16) + 
+                    ([uint32]$startParts[2] -shl 8)  + 
+                    [uint32]$startParts[3]
 
-        $endInt = ([int]$endParts[0] -shl 24) + 
-                  ([int]$endParts[1] -shl 16) + 
-                  ([int]$endParts[2] -shl 8)  + 
-                  [int]$endParts[3]
+        $endInt = ([uint32]$endParts[0] -shl 24) + 
+                  ([uint32]$endParts[1] -shl 16) + 
+                  ([uint32]$endParts[2] -shl 8)  + 
+                  [uint32]$endParts[3]
 
         if ($startInt -gt $endInt) {
             Write-Error "Start IP must be less than or equal to end IP"
@@ -87,7 +90,7 @@ function Get-IPRange {
 
 Write-Host "Network Scanner with Hostname Resolution" -ForegroundColor Cyan
 Write-Host "Supported formats:"
-Write-Host "  CIDR: 192.168.1.0/24"
+Write-Host "  CIDR: 192.168.1.0/24   (scans .1 to .254)"
 Write-Host "  Range: 192.168.1.1-192.168.1.254`n"
 
 $rangeInput = Read-Host "Enter range"
@@ -99,8 +102,8 @@ if ($ipList.Count -eq 0) {
     exit
 }
 
-Write-Host "Scanning $($ipList.Count) hosts..." -ForegroundColor Green
-Write-Host ""
+Write-Host "Generated $($ipList.Count) host IPs to scan." -ForegroundColor Green
+Write-Host "First: $($ipList[0])   Last: $($ipList[-1])`n"
 
 $ports = @(21, 80, 443, 445, 3389, 5985)
 $total = $ipList.Count
@@ -116,15 +119,17 @@ foreach ($ip in $ipList) {
         if ($result.Status -eq 'Success') {
             Write-Host " LIVE" -ForegroundColor Green
 
-            # Hostname resolution (reverse DNS) - with timeout handling
+            # Hostname resolution
             $hostname = "N/A"
             try {
                 $resolveTask = [System.Net.Dns]::GetHostEntryAsync($ip)
-                if ($resolveTask.Wait(1500)) {  # 1.5 second timeout
-                    $hostname = $resolveTask.Result.HostName
-                    if ($hostname -eq $ip) { $hostname = "N/A" }  # If no name returned
+                if ($resolveTask.Wait(1500)) {
+                    $resolved = $resolveTask.Result.HostName
+                    if ($resolved -and $resolved -ne $ip) {
+                        $hostname = $resolved
+                    }
                 }
-            } catch { }  # Silent on resolution failure/timeout
+            } catch { }
 
             if ($hostname -ne "N/A") {
                 Write-Host "    Hostname: $hostname" -ForegroundColor White
@@ -133,7 +138,6 @@ foreach ($ip in $ipList) {
             # Port checking
             Write-Host "    Checking ports $($ports -join ', ') ..." -NoNewline
             $openPorts = @()
-
             foreach ($port in $ports) {
                 $tcp = New-Object System.Net.Sockets.TcpClient
                 $connect = $tcp.BeginConnect($ip, $port, $null, $null)
@@ -150,7 +154,7 @@ foreach ($ip in $ipList) {
                 Write-Host " None open" -ForegroundColor Yellow
             }
 
-            # SMB shares if 445 open
+            # SMB shares
             if ($openPorts -contains 445) {
                 Write-Host "    Checking SMB shares ..." -NoNewline
                 try {
@@ -161,7 +165,7 @@ foreach ($ip in $ipList) {
                         foreach ($line in $output) {
                             if ($line -match "^Share name") { $inShares = $true; continue }
                             if ($inShares -and $line -match "^[A-Za-z\$]") {
-                                $shareName = ($line -split '\s+')[0]
+                                $shareName = ($line -split '\s+')[0].Trim()
                                 if ($shareName) { $shares += $shareName }
                             }
                             if ($line -match "The command completed successfully") { break }
