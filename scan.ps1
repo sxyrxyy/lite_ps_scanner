@@ -1,3 +1,6 @@
+# Enhanced Network Scanner with Hostname Resolution
+# Supports CIDR or range, fast timeouts, hostname lookup on live hosts
+
 function Get-IPRange {
     param (
         [string]$InputRange
@@ -5,7 +8,7 @@ function Get-IPRange {
 
     $ipList = @()
 
-    # CIDR notation: e.g., 192.168.1.0/24
+    # CIDR notation
     if ($InputRange -match '^\d+\.\d+\.\d+\.\d+/\d+$') {
         $parts = $InputRange -split '/'
         $baseIP = $parts[0]
@@ -26,7 +29,7 @@ function Get-IPRange {
         $networkInt = $ipInt -band $mask
         $hostMax = ([math]::Pow(2, (32 - $prefix))) - 1
 
-        if ($hostMax -le 1) {  # /31 or /32 has no usable hosts for scanning
+        if ($hostMax -le 1) {
             Write-Warning "CIDR $InputRange has no scannable hosts (/$prefix)."
             return @()
         }
@@ -35,13 +38,13 @@ function Get-IPRange {
             $hostInt = $networkInt + $i
             $oct1 = ($hostInt -shr 24) -band 255
             $oct2 = ($hostInt -shr 16) -band 255
-            $oct3 = ($hostInt -shr 8)  -band 255
+            $oct3 = ($hostInt -  8)  -band 255
             $oct4 = $hostInt -band 255
             $ipList += "$oct1.$oct2.$oct3.$oct4"
         }
         return $ipList
     }
-    # Range format: startIP-endIP
+    # Range format
     elseif ($InputRange -match '^\d+\.\d+\.\d+\.\d+-\d+\.\d+\.\d+\.\d+$') {
         $parts = $InputRange -split '-'
         $startIP = $parts[0]
@@ -82,7 +85,7 @@ function Get-IPRange {
 
 # === Main Script ===
 
-Write-Host "Network Scanner" -ForegroundColor Cyan
+Write-Host "Network Scanner with Hostname Resolution" -ForegroundColor Cyan
 Write-Host "Supported formats:"
 Write-Host "  CIDR: 192.168.1.0/24"
 Write-Host "  Range: 192.168.1.1-192.168.1.254`n"
@@ -113,6 +116,21 @@ foreach ($ip in $ipList) {
         if ($result.Status -eq 'Success') {
             Write-Host " LIVE" -ForegroundColor Green
 
+            # Hostname resolution (reverse DNS) - with timeout handling
+            $hostname = "N/A"
+            try {
+                $resolveTask = [System.Net.Dns]::GetHostEntryAsync($ip)
+                if ($resolveTask.Wait(1500)) {  # 1.5 second timeout
+                    $hostname = $resolveTask.Result.HostName
+                    if ($hostname -eq $ip) { $hostname = "N/A" }  # If no name returned
+                }
+            } catch { }  # Silent on resolution failure/timeout
+
+            if ($hostname -ne "N/A") {
+                Write-Host "    Hostname: $hostname" -ForegroundColor White
+            }
+
+            # Port checking
             Write-Host "    Checking ports $($ports -join ', ') ..." -NoNewline
             $openPorts = @()
 
@@ -132,6 +150,7 @@ foreach ($ip in $ipList) {
                 Write-Host " None open" -ForegroundColor Yellow
             }
 
+            # SMB shares if 445 open
             if ($openPorts -contains 445) {
                 Write-Host "    Checking SMB shares ..." -NoNewline
                 try {
@@ -141,7 +160,7 @@ foreach ($ip in $ipList) {
                         $inShares = $false
                         foreach ($line in $output) {
                             if ($line -match "^Share name") { $inShares = $true; continue }
-                            if ($inShares -and $line -match "^[A-Za-z]") {
+                            if ($inShares -and $line -match "^[A-Za-z\$]") {
                                 $shareName = ($line -split '\s+')[0]
                                 if ($shareName) { $shares += $shareName }
                             }
